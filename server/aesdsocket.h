@@ -52,8 +52,4 @@
 /* public functions */
 int start_server();
 
-/* public variables */
-extern int server_socket;
-extern pthread_mutex_t log_mutex;
-
 #endif
