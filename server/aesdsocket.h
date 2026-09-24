@@ -49,6 +49,8 @@
 #include <stdbool.h>
 
 /****************** Function Prototypes ******************/
+
+#define USE_AESD_CHAR_DEVICE 1
 /* public functions */
 int start_server();
 

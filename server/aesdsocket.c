@@ -11,7 +11,12 @@
 #define PORT 9000
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
+#if USE_AESD_CHAR_DEVICE
+#define LOG_FILE "/dev/aesdchar"
+#else
 #define LOG_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 #define LOG_FILE_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
 #define LOG_FILE_FLAGS (O_CREAT | O_WRONLY | O_APPEND)
 
@@ -59,16 +64,19 @@ void timer_handler(union sigval sv)
     if (tm_info == NULL) {
         return;
     }
+    
+    /* if Device driver is used do not append timestamp */
+    if (!USE_AESD_CHAR_DEVICE) {
 
-    strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
-
-    pthread_mutex_lock(&log_file_mutex);
-    FILE *fp = fopen(LOG_FILE, "a");
-    if (fp) {
-        fputs(timestamp, fp);
-        fclose(fp);
-    }
+        strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
+        pthread_mutex_lock(&log_file_mutex);
+        FILE *fp = fopen(LOG_FILE, "a");
+        if (fp) {
+            fputs(timestamp, fp);
+            fclose(fp);
+        }
     pthread_mutex_unlock(&log_file_mutex);
+    }
 }
 
 void daemonize(void)
@@ -108,8 +116,9 @@ int main(int argc, char *argv[])
     parse_arguments(argc, argv);
 
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
+#if !USE_AESD_CHAR_DEVICE
     unlink(LOG_FILE);
-
+#endif
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -292,7 +301,9 @@ static void cleanup(void)
 
     join_all_threads();
     pthread_mutex_destroy(&log_file_mutex);
+#if !USE_AESD_CHAR_DEVICE
     unlink(LOG_FILE);
+#endif
     syslog(LOG_INFO, "Server shutting down");
     closelog();
 }
