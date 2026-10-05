@@ -11,10 +11,11 @@
 #define PORT 9000
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
+
 #if USE_AESD_CHAR_DEVICE
-#define LOG_FILE "/dev/aesdchar"
+	#define LOG_FILE "/dev/aesdchar"
 #else
-#define LOG_FILE "/var/tmp/aesdsocketdata"
+	#define LOG_FILE "/var/tmp/aesdsocketdata"
 #endif
 
 #define LOG_FILE_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
@@ -33,10 +34,11 @@ static struct listhead head;
 volatile sig_atomic_t exit_flag = 0;
 static int server_socket = -1;
 static pthread_mutex_t log_file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
+#if  !USE_AESD_CHAR_DEVICE
 static timer_t timerid;
 static struct sigevent sev;
 static struct itimerspec its;
+#endif
 
 static int run_as_daemon = 0;
 
@@ -69,19 +71,17 @@ void timer_handler(union sigval sv)
     if (tm_info == NULL) {
         return;
     }
-    
-    /* if Device driver is used do not append timestamp */
-    if (!USE_AESD_CHAR_DEVICE) {
 
-        strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
-        pthread_mutex_lock(&log_file_mutex);
-        FILE *fp = fopen(LOG_FILE, "a");
-        if (fp) {
-            fputs(timestamp, fp);
-            fclose(fp);
-        }
+    /* if Device driver is used do not append timestamp */
+       strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
+       pthread_mutex_lock(&log_file_mutex);
+       FILE *fp = fopen(LOG_FILE, "a");
+       if (fp) {
+	          fputs(timestamp, fp);
+        	  fclose(fp);
+          }
     pthread_mutex_unlock(&log_file_mutex);
-    }
+
 }
 #endif
 void daemonize(void)
@@ -303,9 +303,12 @@ static void cleanup(void)
         close(server_socket);
     }
 
+
+#if !USE_AESD_CHAR_DEVICE
     if (timerid != (timer_t)0) {
         timer_delete(timerid);
     }
+#endif
 
     join_all_threads();
     pthread_mutex_destroy(&log_file_mutex);
