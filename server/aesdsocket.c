@@ -51,10 +51,15 @@ static void join_all_threads(void);
 static void cleanup(void);
 static void signal_handler(int signum);
 static void daemonize(void);
+
+#if !USE_AESD_CHAR_DEVICE
 static void initialize_timer(void);
+#endif
+
 static void parse_arguments(int argc, char *argv[]);
 static void *client_handler(void *arg);
 
+#if !USE_AESD_CHAR_DEVICE
 void timer_handler(union sigval sv)
 {
     time_t now = time(NULL);
@@ -78,7 +83,7 @@ void timer_handler(union sigval sv)
     pthread_mutex_unlock(&log_file_mutex);
     }
 }
-
+#endif
 void daemonize(void)
 {
     pid_t pid = fork();
@@ -116,9 +121,11 @@ int main(int argc, char *argv[])
     parse_arguments(argc, argv);
 
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
+
 #if !USE_AESD_CHAR_DEVICE
     unlink(LOG_FILE);
 #endif
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -131,9 +138,9 @@ int main(int argc, char *argv[])
     if (run_as_daemon) {
         daemonize();
     }
-
+#if !USE_AESD_CHAR_DEVICE
     initialize_timer();
-
+#endif
     SLIST_INIT(&head);
     syslog(LOG_INFO, "Server started on port %d", PORT);
 
@@ -151,7 +158,7 @@ static void parse_arguments(int argc, char *argv[])
         }
     }
 }
-
+#if !USE_AESD_CHAR_DEVICE
 static void initialize_timer(void)
 {
     sev.sigev_notify = SIGEV_THREAD;
@@ -173,6 +180,7 @@ static void initialize_timer(void)
         exit(EXIT_FAILURE);
     }
 }
+#endif
 
 static int setup_server_socket(void)
 {
