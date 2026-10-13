@@ -14,6 +14,12 @@
 
 #if USE_AESD_CHAR_DEVICE
 	#define LOG_FILE "/dev/aesdchar"
+/** @brief:
+ *  When the string sent over the socket matches the pattern AESDCHAR_IOCSEEKTO:X,Y (where X and Y are unsigned decimal integers)
+ *  the application should interpret X as the write command index and Y as the offset within that command.
+ */
+#define IOCTL_STRING_CODE "AESDCHAR_IOCSEEKTO:X,Y"
+
 #else
 	#define LOG_FILE "/var/tmp/aesdsocketdata"
 #endif
@@ -53,6 +59,7 @@ static void join_all_threads(void);
 static void cleanup(void);
 static void signal_handler(int signum);
 static void daemonize(void);
+static bool is_valid_ioctl_string(const char *str, int *x_entry_index, int *y_entry_offset);
 
 #if !USE_AESD_CHAR_DEVICE
 static void initialize_timer(void);
@@ -148,6 +155,24 @@ int main(int argc, char *argv[])
 
     cleanup();
     return 0;
+}
+
+
+static bool is_valid_ioctl_string(const char *str, int *x_entry_index, int *y_entry_offset)
+{
+    const char *prefix = "AESDCHAR_IOCSEEKTO:";
+    if (strncmp(str, prefix, strlen(prefix)) != 0) {
+        return false;
+    }
+
+    const char *numbers = str + strlen(prefix);
+    int x, y;
+    if (sscanf(numbers, "%d,%d", &x, &y) != 2) {
+        return false;
+    }
+    *x_entry_index = x;
+    *y_entry_offset = y;
+    return true;
 }
 
 static void parse_arguments(int argc, char *argv[])
@@ -324,7 +349,7 @@ void *client_handler(void *arg)
     thread_entry_t *entry = (thread_entry_t *)arg;
     int client_socket = entry->client_socket;
 
-    if (handle_storage_and_response(client_socket) != 0) {
+    if (handle_rx_tx_buffer(client_socket) != 0) {
         syslog(LOG_ERR, "Failed to process client data");
     }
 
@@ -333,40 +358,61 @@ void *client_handler(void *arg)
     return NULL;
 }
 
-static int handle_storage_and_response(int client_socket)
+/* New requirement: Handle IOCTL commands 
+* when the string sent over the socket matches the pattern AESDCHAR_IOCSEEKTO:X,Y (where X and Y are unsigned decimal integers)
+* the application should interpret X as the write command index and Y as the offset within that command.
+* the sring should be parsed and the appropriate ioctl command should be sent to the character device.
+* the server should then sent back the same string over the socket to the client, without appending it to the log file.
+*/
+static int handle_rx_tx_buffer(int client_socket)
 {
+    /* this buffer may hold the received ioctl commands which wont be stored in the log file, but sent back to the client */
+    char buffer[BUFFER_SIZE];
+    bool new_line_found = false;
+    /* this packet will contain the complete message to store in the file*/
     char *packet = NULL;
     size_t packet_size = 0;
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_received;
-    bool newline_found = false;
 
-    while (!newline_found && (bytes_received = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
+    ssize_t bytes_received =0;
+    while (!new_line_found && (bytes_received = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
         syslog(LOG_INFO, "Received data from client");
 
-        char *new_packet = realloc(packet, packet_size + bytes_received);
-        if (new_packet == NULL) {
-            syslog(LOG_ERR, "Memory allocation failed: %s", strerror(errno));
-            free(packet);
-            return -1;
+        /*1: before appending to log content, check if it's an IOCTL command */
+        if (is_valid_ioctl_string(buffer, NULL, NULL)) {
+            syslog(LOG_INFO, "Received IOCTL command: %s", buffer);
+            // Send the same string back to the client
+            int result = send(client_socket, buffer, bytes_received, 0);
+            
+            if (result < 0) {
+                syslog(LOG_ERR, "Failed to send data: %s", strerror(errno));
+                return -1;
+            }
+            /* should not free or return as other data may be received later*/
         }
+        else {
+                syslog(LOG_INFO, "Received data to store in log file");
+                char *new_packet = realloc(packet, packet_size + bytes_received);
+                if (new_packet == NULL) {
+                    syslog(LOG_ERR, "Memory allocation failed: %s", strerror(errno));
+                    free(packet);
+                    return -1;
+                }
+                packet = new_packet;
+                memcpy(packet + packet_size, buffer, bytes_received);
+                packet_size += bytes_received;
 
-        packet = new_packet;
-        memcpy(packet + packet_size, buffer, bytes_received);
-        packet_size += bytes_received;
-
-        if (memchr(buffer, '\n', bytes_received) != NULL) {
-            newline_found = true;
+                if (memchr(buffer, '\n', bytes_received) != NULL) {
+                    new_line_found = true;
+                }
         }
     }
-
     if (bytes_received < 0) {
         syslog(LOG_ERR, "Failed to receive data: %s", strerror(errno));
         free(packet);
         return -1;
     }
 
-    if (newline_found) {
+    if (new_line_found) {
         syslog(LOG_INFO, "Newline received; appending and sending log content");
 
         if (append_to_log_file(packet, packet_size) < 0) {
@@ -379,7 +425,6 @@ static int handle_storage_and_response(int client_socket)
             return -1;
         }
     }
-
     free(packet);
     return 0;
 }
