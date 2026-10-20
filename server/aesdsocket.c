@@ -7,6 +7,8 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include "aesd_ioctl.h"
 
 #define PORT 9000
 #define BACKLOG 5
@@ -18,7 +20,7 @@
  *  When the string sent over the socket matches the pattern AESDCHAR_IOCSEEKTO:X,Y (where X and Y are unsigned decimal integers)
  *  the application should interpret X as the write command index and Y as the offset within that command.
  */
-#define IOCTL_STRING_CODE "AESDCHAR_IOCSEEKTO:X,Y"
+    #define IOCTL_STRING_CODE "AESDCHAR_IOCSEEKTO:X,Y"
 
 #else
 	#define LOG_FILE "/var/tmp/aesdsocketdata"
@@ -40,6 +42,8 @@ static struct listhead head;
 volatile sig_atomic_t exit_flag = 0;
 static int server_socket = -1;
 static pthread_mutex_t log_file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
 #if  !USE_AESD_CHAR_DEVICE
 static timer_t timerid;
 static struct sigevent sev;
@@ -50,16 +54,20 @@ static int run_as_daemon = 0;
 
 static int setup_server_socket(void);
 static int handle_server_loop(void);
-static int handle_storage_and_response(int client_socket);
-static int append_to_log_file(const char *data, ssize_t data_len);
-static int send_log_file_content(int client_socket);
+
 static int create_threaded_connection(int client_socket);
 static void reap_inactive_threads(void);
 static void join_all_threads(void);
 static void cleanup(void);
 static void signal_handler(int signum);
 static void daemonize(void);
-static bool is_valid_ioctl_string(const char *str, int *x_entry_index, int *y_entry_offset);
+
+
+static int handle_rx_tx_buffer(int client_socket);
+static int process_request(int client_socket,const char *request,size_t request_size,bool is_ioctl,int x_entry_index,int y_entry_offset);
+static int send_all(int client_socket, const char *buffer, size_t size);
+static bool is_valid_ioctl_string(const char *request, int *x_entry_index, int *y_entry_offset);
+
 
 #if !USE_AESD_CHAR_DEVICE
 static void initialize_timer(void);
@@ -155,24 +163,6 @@ int main(int argc, char *argv[])
 
     cleanup();
     return 0;
-}
-
-
-static bool is_valid_ioctl_string(const char *str, int *x_entry_index, int *y_entry_offset)
-{
-    const char *prefix = "AESDCHAR_IOCSEEKTO:";
-    if (strncmp(str, prefix, strlen(prefix)) != 0) {
-        return false;
-    }
-
-    const char *numbers = str + strlen(prefix);
-    int x, y;
-    if (sscanf(numbers, "%d,%d", &x, &y) != 2) {
-        return false;
-    }
-    *x_entry_index = x;
-    *y_entry_offset = y;
-    return true;
 }
 
 static void parse_arguments(int argc, char *argv[])
@@ -358,130 +348,244 @@ void *client_handler(void *arg)
     return NULL;
 }
 
-/* New requirement: Handle IOCTL commands 
-* when the string sent over the socket matches the pattern AESDCHAR_IOCSEEKTO:X,Y (where X and Y are unsigned decimal integers)
-* the application should interpret X as the write command index and Y as the offset within that command.
-* the sring should be parsed and the appropriate ioctl command should be sent to the character device.
-* the server should then sent back the same string over the socket to the client, without appending it to the log file.
-*/
+
 static int handle_rx_tx_buffer(int client_socket)
 {
-    /* this buffer may hold the received ioctl commands which wont be stored in the log file, but sent back to the client */
-    char buffer[BUFFER_SIZE];
-    bool new_line_found = false;
-    /* this packet will contain the complete message to store in the file*/
     char *packet = NULL;
     size_t packet_size = 0;
+    size_t packet_capacity = 0;
+    char rx_buffer[BUFFER_SIZE];
+    ssize_t bytes_received;
+    int result = 0;
 
-    ssize_t bytes_received =0;
-    while (!new_line_found && (bytes_received = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
-        syslog(LOG_INFO, "Received data from client");
+    while ((bytes_received = recv(client_socket,rx_buffer,sizeof(rx_buffer),0)) > 0)
+    {
+        for (ssize_t i = 0; i < bytes_received; i++)
+        {
+            /* Grow the packet buffer when necessary. */
+            if (packet_size + 1 >= packet_capacity)
+            {
+                size_t new_capacity = packet_capacity == 0 ? BUFFER_SIZE : packet_capacity * 2;
+                char *new_packet = realloc(packet, new_capacity);
 
-        /*1: before appending to log content, check if it's an IOCTL command */
-        if (is_valid_ioctl_string(buffer, NULL, NULL)) {
-            syslog(LOG_INFO, "Received IOCTL command: %s", buffer);
-            // Send the same string back to the client
-            int result = send(client_socket, buffer, bytes_received, 0);
-            
-            if (result < 0) {
-                syslog(LOG_ERR, "Failed to send data: %s", strerror(errno));
-                return -1;
-            }
-            /* should not free or return as other data may be received later*/
-        }
-        else {
-                syslog(LOG_INFO, "Received data to store in log file");
-                char *new_packet = realloc(packet, packet_size + bytes_received);
-                if (new_packet == NULL) {
-                    syslog(LOG_ERR, "Memory allocation failed: %s", strerror(errno));
-                    free(packet);
-                    return -1;
+                if (new_packet == NULL)
+                {
+                    printf("Failed to allocate memory for packet buffer\n");
+                    result = -1;
+                    break;
                 }
+
                 packet = new_packet;
-                memcpy(packet + packet_size, buffer, bytes_received);
-                packet_size += bytes_received;
-
-                if (memchr(buffer, '\n', bytes_received) != NULL) {
-                    new_line_found = true;
-                }
-        }
-    }
-    if (bytes_received < 0) {
-        syslog(LOG_ERR, "Failed to receive data: %s", strerror(errno));
-        free(packet);
-        return -1;
-    }
-
-    if (new_line_found) {
-        syslog(LOG_INFO, "Newline received; appending and sending log content");
-
-        if (append_to_log_file(packet, packet_size) < 0) {
-            free(packet);
-            return -1;
-        }
-
-        if (send_log_file_content(client_socket) < 0) {
-            free(packet);
-            return -1;
-        }
-    }
-    free(packet);
-    return 0;
-}
-
-static int append_to_log_file(const char *data, ssize_t data_len)
-{
-    pthread_mutex_lock(&log_file_mutex);
-
-    int log_fd = open(LOG_FILE, LOG_FILE_FLAGS, LOG_FILE_MODE);
-    if (log_fd < 0) {
-        syslog(LOG_ERR, "Failed to open log file for appending: %s", strerror(errno));
-        pthread_mutex_unlock(&log_file_mutex);
-        return -1;
-    }
-
-    if (write(log_fd, data, data_len) < 0) {
-        syslog(LOG_ERR, "Failed to write to log file: %s", strerror(errno));
-        close(log_fd);
-        pthread_mutex_unlock(&log_file_mutex);
-        return -1;
-    }
-
-    close(log_fd);
-    pthread_mutex_unlock(&log_file_mutex);
-    return 0;
-}
-
-static int send_log_file_content(int client_socket)
-{
-    pthread_mutex_lock(&log_file_mutex);
-
-    int log_fd = open(LOG_FILE, O_RDONLY);
-    if (log_fd < 0) {
-        syslog(LOG_ERR, "Failed to open log file for reading: %s", strerror(errno));
-        pthread_mutex_unlock(&log_file_mutex);
-        return -1;
-    }
-
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_read;
-
-    while ((bytes_read = read(log_fd, buffer, sizeof(buffer))) > 0) {
-        ssize_t total_sent = 0;
-
-        while (total_sent < bytes_read) {
-            ssize_t sent = send(client_socket, buffer + total_sent, bytes_read - total_sent, 0);
-            if (sent <= 0) {
-                syslog(LOG_ERR, "Failed to send log file content: %s", strerror(errno));
-                close(log_fd);
-                pthread_mutex_unlock(&log_file_mutex);
-                return -1;
+                packet_capacity = new_capacity;
             }
-            total_sent += sent;
+
+            packet[packet_size++] = rx_buffer[i];
+            packet[packet_size] = '\0';
+
+            if (rx_buffer[i] != '\n')
+            {
+                printf("Received data: %c\n", rx_buffer[i]);
+                continue;
+            }
+
+            /*
+             * A complete newline-terminated request is available.
+             * Validate whether it is an ioctl command, then dispatch it.
+             */
+            int x_entry_index;
+            int y_entry_offset;
+            bool is_ioctl = is_valid_ioctl_string(packet,&x_entry_index,&y_entry_offset);
+
+            if (process_request(client_socket,packet,packet_size,is_ioctl,x_entry_index,y_entry_offset) < 0)
+            {
+                result = -1;
+                printf("Failed to process request\n");
+                break;
+            }
+
+            packet_size = 0;
+        }
+
+        if (result < 0)
+        {
+            printf("Error occurred while processing received data\n");
+            break;
         }
     }
 
-    close(log_fd);
-    pthread_mutex_unlock(&log_file_mutex);
+    if (bytes_received < 0 && errno != EINTR)
+    {
+        result = -1;
+    }
+
+    printf("Cleaning up packet buffer\n");
+    free(packet);
+    return result;
+}
+
+
+static int send_all(int client_socket, const char *buffer, size_t size)
+{
+    size_t total_sent = 0;
+
+    while (total_sent < size)
+    {
+        ssize_t bytes_sent = send(client_socket,
+                                  buffer + total_sent,
+                                  size - total_sent,
+                                  0);
+
+        if (bytes_sent < 0 && errno == EINTR)
+        {
+            continue;
+        }
+
+        if (bytes_sent <= 0)
+        {
+            return -1;
+        }
+
+        total_sent += (size_t)bytes_sent;
+    }
+
     return 0;
+}
+
+static int process_request(int client_socket,const char *request,size_t request_size,bool is_ioctl,int x_entry_index,int y_entry_offset)
+{
+    int device_fd;
+    int response_fd;
+    int result = 0;
+
+    device_fd = open(LOG_FILE, O_RDWR);
+    if (device_fd < 0)
+    {
+        perror("open " LOG_FILE);
+        return -1;
+    }
+
+    response_fd = device_fd;
+
+    if (is_ioctl)
+    {
+        struct aesd_seekto seekto = {
+            .write_cmd = x_entry_index,
+            .write_cmd_offset = y_entry_offset
+        };
+
+        if (ioctl(device_fd, AESDCHAR_IOCSEEKTO, &seekto) < 0)
+        {
+            perror("ioctl AESDCHAR_IOCSEEKTO");
+            result = -1;
+        }
+        else if (send_all(client_socket, request, request_size) < 0)
+        {
+            perror("send ioctl request");
+            result = -1;
+        }
+    }
+    else
+    {
+        size_t total_written = 0;
+
+        while (total_written < request_size)
+        {
+            ssize_t bytes_written = write(device_fd,
+                                          request + total_written,
+                                          request_size - total_written);
+
+            if (bytes_written < 0 && errno == EINTR)
+            {
+                continue;
+            }
+
+            if (bytes_written <= 0)
+            {
+                perror("write " LOG_FILE);
+                result = -1;
+                break;
+            }
+
+            total_written += (size_t)bytes_written;
+        }
+
+        /*
+         * A write advances device_fd's position to the end of the write.
+         * Open a separate descriptor to read from the beginning without
+         * calling lseek().
+         */
+        if (result == 0)
+        {
+            response_fd = open(LOG_FILE, O_RDONLY);
+
+            if (response_fd < 0)
+            {
+                perror("open " LOG_FILE " for reading");
+                result = -1;
+            }
+        }
+    }
+
+    if (result == 0)
+    {
+        char buffer[BUFFER_SIZE];
+        ssize_t bytes_read;
+
+        while ((bytes_read = read(response_fd,
+                                  buffer,
+                                  sizeof(buffer))) > 0)
+        {
+            if (send_all(client_socket, buffer, (size_t)bytes_read) < 0)
+            {
+                perror("send device response");
+                result = -1;
+                break;
+            }
+        }
+
+        if (bytes_read < 0)
+        {
+            if (errno != EINTR)
+            {
+                perror("read " LOG_FILE);
+                result = -1;
+            }
+        }
+    }
+
+    if (response_fd != device_fd)
+    {
+        if (close(response_fd) < 0)
+        {
+            perror("close response descriptor");
+            result = -1;
+        }
+    }
+
+    if (close(device_fd) < 0)
+    {
+        perror("close device descriptor");
+        result = -1;
+    }
+
+    return result;
+}
+
+static bool is_valid_ioctl_string(const char *request, int *x_entry_index, int *y_entry_offset)
+{
+    const char *prefix = "AESDCHAR_IOCSEEKTO:";
+    size_t prefix_len = strlen(prefix);
+
+    if (strncmp(request, prefix, prefix_len) != 0)
+    {
+        return false;
+    }
+
+    const char *params = request + prefix_len;
+    if (sscanf(params, "%d,%d", x_entry_index, y_entry_offset) != 2)
+    {
+        return false;
+    }
+
+    return true;
 }
