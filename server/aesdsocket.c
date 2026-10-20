@@ -387,7 +387,10 @@ static int handle_rx_tx_buffer(int client_socket)
                 printf("Received data: %c\n", rx_buffer[i]);
                 continue;
             }
-
+            else
+            {
+                printf("Complete packed received: %s \n", packet);
+            }
             /*
              * A complete newline-terminated request is available.
              * Validate whether it is an ioctl command, then dispatch it.
@@ -478,11 +481,11 @@ static int process_request(int client_socket,const char *request,size_t request_
             perror("ioctl AESDCHAR_IOCSEEKTO");
             result = -1;
         }
-        else if (send_all(client_socket, request, request_size) < 0)
+        /*else if (send_all(client_socket, request, request_size) < 0)
         {
             perror("send ioctl request");
             result = -1;
-        }
+        }*/
     }
     else
     {
